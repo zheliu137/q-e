@@ -2156,7 +2156,7 @@
       !
     ENDIF
     !
-    IF (etf_mem == 0) then
+    IF (etf_mem == 0 .or. etf_mem == 3) then
       !
       IF (use_ws) THEN
         DO irn = ir_start, ir_stop
@@ -2693,6 +2693,158 @@
     END SUBROUTINE ephwan2blochp_mem
     !--------------------------------------------------------------------------
     !
+    !---------------------------------------------------------------------------
+    SUBROUTINE ephwan2blochp_mem_nodisk(imode, nmodes, xxq, irvec_g, ndegen_g, nrr_g, epmatf, nbnd, nrr_k, dims, nat)
+    !---------------------------------------------------------------------------
+    !!
+    !! Even though this is for phonons, I use the same notations
+    !! adopted for the electronic case (nmodes->nmodes etc)
+    !!
+    USE kinds,            ONLY : DP
+    USE constants_epw,    ONLY : twopi, ci, czero
+    USE io_files,         ONLY : prefix, tmp_dir
+    USE mp,               ONLY : mp_sum
+    USE mp_world,         ONLY : world_comm
+    USE epwcom,           ONLY : use_ws
+    USE elph2,            ONLY : epmatwp
+    USE mp_world,         ONLY : mpime
+    USE division,         ONLY : para_bounds
+#if defined(__MPI)
+    USE parallel_include, ONLY : MPI_OFFSET_KIND, MPI_SEEK_SET, &
+                                 MPI_DOUBLE_PRECISION, MPI_STATUS_IGNORE, &
+                                 MPI_MODE_RDONLY,MPI_INFO_NULL
+#endif
+    !
+    IMPLICIT NONE
+    !
+    !  input variables
+    !
+    INTEGER, INTENT(in) :: imode
+    !! Current mode
+    INTEGER, INTENT(in) :: nmodes
+    !! Total number of modes
+    INTEGER, INTENT(in) :: nrr_g
+    !! Number of phononic WS points
+    INTEGER, INTENT(in) :: dims
+    !! Is equal to the number of Wannier function if use_ws == .TRUE.
+    !! Is equal to 1 otherwise.
+    INTEGER, INTENT(in) :: nat
+    !! Is equal to the number of atoms if use_ws == .TRUE. or 1 otherwise.
+    INTEGER, INTENT(in) :: irvec_g(3, nrr_g)
+    !! Coordinates of WS points
+    INTEGER, INTENT(in) :: ndegen_g(dims, nrr_g, nat)
+    !! Number of degeneracy of WS points
+    INTEGER, INTENT(in) :: nbnd
+    !! Number of bands
+    INTEGER, INTENT(in) ::  nrr_k
+    !! Number of electronic WS points
+    REAL(KIND = DP) :: xxq(3)
+    !! Kpoint for the interpolation (WARNING: this must be in crystal coord!)
+    COMPLEX(KIND = DP), INTENT(out) :: epmatf(nbnd, nbnd, nrr_k)
+    !! e-p matrix in Bloch representation, fine grid
+    !
+    ! Local variables
+    CHARACTER(LEN = 256) :: filint
+    !! File name
+    INTEGER :: ir
+    !! Real space WS index
+    INTEGER :: ir_start
+    !! Starting ir for this pool
+    INTEGER :: ir_stop
+    !! Ending ir for this pool
+    INTEGER :: iw
+    !! Counter on Wannier functions
+    INTEGER :: iunepmatwp2
+    !! Return the file unit
+    INTEGER :: na
+    !! Index on atom
+    INTEGER :: ierr
+    !! Error status
+#if defined(__MPI)
+    INTEGER(KIND = MPI_OFFSET_KIND) :: lrepmatw
+    !! Offset to tell where to start reading the file
+    INTEGER(KIND = MPI_OFFSET_KIND) :: lrepmatw2
+    !! Offset to tell where to start reading the file
+#else
+    INTEGER(KIND = 8) :: lrepmatw
+    !! Offset to tell where to start reading the file
+    INTEGER(KIND = 8) :: lrepmatw2
+    !! Offset to tell where to start reading the file
+#endif
+    !
+    REAL(KIND = DP) :: rdotk
+    !! Exponential for the FT
+    COMPLEX(KIND = DP) :: cfac(nrr_g, dims)
+    !! Factor for the FT
+    COMPLEX(KIND = DP), ALLOCATABLE :: epmatw(:, :, :)
+    !! El-ph matrix elements
+    !
+    CALL start_clock('ephW2Bp')
+    !----------------------------------------------------------
+    !  STEP 3: inverse Fourier transform of g to fine k mesh
+    !----------------------------------------------------------
+    !
+    !  [Eqn. 22 of PRB 76, 165108 (2007)]
+    !  g~(R_e,q') = 1/ndegen(R_p) sum_R_p e^{iq'R_p} g(R_e,R_p)
+    !
+    !  g~(R_e,q') is epmatf(nmodes, nmodes, ik )
+    !  every pool works with its own subset of k points on the fine grid
+    !
+    CALL para_bounds(ir_start, ir_stop, nrr_g)
+    !
+    cfac(:, :) = czero
+    !
+    IF (use_ws) THEN
+      na = (imode - 1) / 3 + 1
+      !
+      DO ir = ir_start, ir_stop
+        !
+        ! note xxq is assumed to be already in cryst coord
+        rdotk = twopi * DOT_PRODUCT(xxq, DBLE(irvec_g(:, ir)))
+        DO iw = 1, dims
+          IF (ndegen_g(iw, ir, na) > 0) &
+            cfac(ir, iw) = EXP(ci * rdotk) / DBLE(ndegen_g(iw, ir, na))
+        ENDDO
+      ENDDO
+    ELSE
+      DO ir = ir_start, ir_stop
+        !
+        ! note xxq is assumed to be already in cryst coord
+        rdotk = twopi * DOT_PRODUCT(xxq, DBLE(irvec_g(:, ir)))
+        cfac(ir, 1) = EXP(ci * rdotk) / DBLE(ndegen_g(1, ir, 1))
+      ENDDO
+    ENDIF
+    !
+    !ALLOCATE(epmatw(nbnd, nbnd, nrr_k), STAT = ierr)
+    IF (ierr /= 0) CALL errore('ephwan2blochp_mem', 'Error allocating epmatw', 1)
+    epmatw(:, :, :) = czero
+    !
+    DO ir = ir_start, ir_stop
+      !
+      ! SP: The following needs a small explaination: although lrepmatw is correctly defined as kind 8 bits or
+      !     kind=MPI_OFFSET_KIND, the number "2" and "8" are default kind 4. The other as well. Therefore
+      !     if the product is too large, this will crash. The solution (kind help recieved from Ian Bush) is below:
+      IF (use_ws) THEN
+        DO iw = 1, dims
+          !CALL ZAXPY(nbnd * nrr_k, cfac(ir, iw), epmatw(iw, :, :), 1, epmatf(iw, :, :), 1)
+          CALL ZAXPY(nbnd * nrr_k, cfac(ir, iw), epmatwp(iw, :, :,imode,ir), 1, epmatf(iw, :, :), 1)
+        ENDDO
+      ELSE
+        !CALL ZAXPY(nbnd * nbnd * nrr_k, cfac(ir, 1), epmatw, 1, epmatf, 1)
+        CALL ZAXPY(nbnd * nbnd * nrr_k, cfac(ir, 1), epmatwp(:,:,:,imode,ir), 1, epmatf, 1)
+      ENDIF
+      !
+    ENDDO
+    DEALLOCATE(epmatw, STAT = ierr)
+    IF (ierr /= 0) CALL errore('ephwan2blochp_mem', 'Error deallocating epmatw', 1)
+    !
+    CALL mp_sum(epmatf, world_comm)
+    !
+    CALL stop_clock('ephW2Bp')
+    !
+    !--------------------------------------------------------------------------
+    END SUBROUTINE ephwan2blochp_mem_nodisk
+    !--------------------------------------------------------------------------
   !--------------------------------------------------------------------------
   END MODULE wan2bloch
   !--------------------------------------------------------------------------

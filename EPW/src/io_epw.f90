@@ -220,7 +220,7 @@
         ENDDO
       ENDDO
       !
-      IF (etf_mem == 0) THEN
+      IF (etf_mem == 0 .or. etf_mem == 3) THEN
         ! SP: The call to epmatwp is now inside the loop
         !     This is important as otherwise the lrepmatw INTEGER
         !     could become too large for integer(kind=4).
@@ -413,7 +413,7 @@
       CALL read_ifc_epw
     ENDIF
     !
-    IF (etf_mem == 0) THEN
+    IF (etf_mem == 0 .or. etf_mem == 3 ) THEN
       ALLOCATE(epmatwp(nbndsub, nbndsub, nrr_k, nmodes, nrr_g), STAT = ierr)
       IF (ierr /= 0) CALL errore('epw_read', 'Error allocating epmatwp', 1)
       epmatwp = czero

@@ -843,7 +843,7 @@
   !
   ! Open the ephmatwp file here
 #if defined(__MPI)
-  IF (etf_mem == 1 .OR. etf_mem == 3) then
+  IF (etf_mem == 1) then
     ! Check for directory given by "outdir"
     !
     filint = TRIM(tmp_dir) // TRIM(prefix)//'.epmatwp'
